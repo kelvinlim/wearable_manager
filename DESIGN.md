@@ -29,8 +29,13 @@ Each decision lists the rejected alternative and why this one won, so edge cases
 2. **Server-rendered FastAPI page for participant enrollment at `/enroll/{code}`.**
    Jinja templates. SPA owns the rest. Rejected: SPA route for enrollment — added CORS + SPA-handled OAuth callback complexity for a one-shot URL.
 
-3. **Two separate Google OAuth clients.**
-   One for researcher OIDC sign-in (`openid email profile`), one for participant Health Migration data sharing (`googlehealth.*`). Rejected: single combined client — mixes identity and data-access scopes in one consent.
+3. **Two separate Google OAuth clients; the participant client is per-study with an app-wide fallback.**
+   - **Researcher OIDC sign-in** (`openid email profile`) is app-wide. One client, configured via `RESEARCHER_GOOGLE_CLIENT_ID/SECRET`. Identity-only, sharing it across studies makes sense.
+   - **Participant Health Migration data sharing** (`googlehealth.*`) is **per-study**. Each PI brings their own Google Cloud project, OAuth client ID/secret, and webhook authorization value, stored on the `studies` row. Rationale: each PI owns their participants' data under their own GCP project, IAM, billing, quotas, and OAuth verification — no shared blast radius.
+   - **App-wide fallback** is supported: when a study's per-study columns are null, the app falls back to `PARTICIPANT_GOOGLE_CLIENT_ID/SECRET` + `PARTICIPANT_GOOGLE_CLOUD_PROJECT_ID` + `WEBHOOK_SECRET` env. Lets small studies ride a shared verification while big labs bring their own.
+   - **Webhook discrimination.** One app endpoint receives notifications from all projects. Subscriber registration sets `clientProvidedSubscriptionName = "study-<id>-user-<healthUserId>"`; the handler parses `study_id` from that field and validates the `Authorization` header against *that study's* `webhook_authorization_value` (or the fallback `WEBHOOK_SECRET` if the study has none).
+   - **Operational consequence.** Each PI bringing their own client independently needs: Google Cloud project + Health API enabled, OAuth consent screen + verification (multi-week third-party security review), test-user list (≤100 cap pre-verification), subscriber registration ceremony. This is a real onboarding burden — accepted in exchange for data sovereignty per PI.
+   - Rejected: single combined client (mixes identity and data-access scopes); single shared participant client (forces all PIs onto one verification, one billing account, and one rate-limit pool).
 
 4. **Deployed on UMN intranet behind nginx under a path prefix.**
    FastAPI `root_path` driven by `APP_PATH` env (default `/wearablemgr/`), `ProxyHeadersMiddleware` for correct redirect URLs. Same pattern as fitbitreg's `APP_PATH` and garmin_django's `appname`.
@@ -62,6 +67,9 @@ Each decision lists the rejected alternative and why this one won, so edge cases
 13. **Build now against the GA API; accept churn.**
     Stay in test-user mode (≤100 users) until OAuth verification clears. Keep the Health API integration thin and isolated in `services/health_*.py` + `workers/ingest.py` so a breaking change is patched in one layer.
 
+14. **Fernet symmetric encryption for per-study Google credentials at rest.**
+    `studies.google_oauth_client_secret` and `studies.webhook_authorization_value` are stored Fernet-encrypted via a `EncryptedText` SQLAlchemy `TypeDecorator`. Key from `STUDY_CREDS_KEY` env (generated via `Fernet.generate_key()`). `client_id` and `google_cloud_project_id` are not secrets and are stored plaintext. Participant OAuth tokens on `participants` remain plaintext for now (separate followup, lower stakes per row). Rejected: cloud KMS (overkill at this scale); plaintext (one DB read leaks every PI's credentials at once). Key rotation = `MultiFernet([new, old])`, deferred until needed.
+
 ## Health Migration API facts that shaped the design
 
 Source: https://developers.google.com/health/migration (researched 2026-04-26). Re-verify before relying — the API was GA on 2026-03-24 and Google recommended waiting until end of May 2026 for production launches.
@@ -89,6 +97,10 @@ users(
 studies(
   id, name, wearable_type_id,
   owner_user_id fk users,
+  google_oauth_client_id,                      -- nullable; participant Health Migration OAuth client (per-study override)
+  google_oauth_client_secret,                  -- nullable; Fernet-encrypted via EncryptedText
+  google_cloud_project_id,                     -- nullable; for projects/{project}/subscribers and quota attribution
+  webhook_authorization_value,                 -- nullable; Fernet-encrypted; the Authorization value Google echoes on this study's notifications
   created_at
 )
 
@@ -217,14 +229,22 @@ wearable_manager/
 
 These are real blockers, not implementation details. Track separately from code work.
 
-1. Google Cloud project; enable Health API.
-2. OAuth consent screen — scopes for both flows.
-3. Two OAuth client IDs (researcher web app + participant web app).
-4. Test-user emails added until verified (≤100 users limit).
-5. Apply for OAuth verification — third-party security review; multi-week.
-6. Provision `WEBHOOK_SECRET`.
-7. Run subscriber-create once webhook URL is live behind nginx (HTTPS only).
-8. UMN nginx route + cert for `/wearablemgr/webhook` and `/wearablemgr/enroll/*`.
+App-wide (one-time):
+
+1. UMN nginx route + cert for `/wearablemgr/webhook` and `/wearablemgr/enroll/*`.
+2. Researcher OIDC OAuth client (web app) — configured via `RESEARCHER_GOOGLE_CLIENT_ID/SECRET`.
+3. *(Optional)* App-wide fallback participant OAuth client — Google Cloud project, Health API enabled, OAuth client, OAuth consent + verification, `WEBHOOK_SECRET`. Skipped if every PI brings their own.
+4. Generate `STUDY_CREDS_KEY` (`python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'`); back up off-host. Losing this key bricks every encrypted credential in the DB.
+
+Per study with a per-study client (decision 3):
+
+1. PI owns a Google Cloud project; enables Health API on it.
+2. PI's OAuth consent screen + scopes (`googlehealth.*` plus `cloud-platform` for subscriber ops).
+3. PI's OAuth client ID + secret (web app type), with `<host>/wearablemgr/enroll/oauth/callback` in authorized redirect URIs.
+4. Test-user emails added until verified (≤100 users per project).
+5. PI's project applies for OAuth verification — third-party security review; multi-week.
+6. PI provisions a webhook authorization value (random secret); stored encrypted on the study row.
+7. Run `subscriber-create --study <id>` once the webhook URL is live behind nginx (HTTPS only).
 
 ## Build phasing
 
